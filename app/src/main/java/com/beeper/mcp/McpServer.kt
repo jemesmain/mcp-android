@@ -1,6 +1,7 @@
 package com.beeper.mcp
 
 import android.content.Context
+import android.net.Uri
 import android.util.Log
 import androidx.core.net.toUri
 import com.beeper.mcp.tools.handleGetChats
@@ -17,8 +18,10 @@ import io.ktor.server.engine.embeddedServer
 import io.ktor.server.netty.Netty
 import io.ktor.server.netty.NettyApplicationEngine
 import io.ktor.server.plugins.cors.routing.CORS
+import io.ktor.server.request.receiveText
 import io.ktor.server.response.respondText
 import io.ktor.server.routing.get
+import io.ktor.server.routing.post
 import io.ktor.server.routing.routing
 import io.ktor.server.sse.SSE
 import io.ktor.server.sse.ServerSSESession
@@ -38,9 +41,15 @@ import io.modelcontextprotocol.kotlin.sdk.server.mcp
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
+import kotlinx.serialization.json.putJsonObject
 import java.net.NetworkInterface
 import java.util.concurrent.ConcurrentHashMap
 
@@ -53,11 +62,10 @@ class McpServer(private val context: Context) {
         private const val SERVICE_NAME = "beeper-mcp-server"
         private const val VERSION = "2.0.0"
     }
-    
 
     private var ktorServer: EmbeddedServer<NettyApplicationEngine, NettyApplicationEngine.Configuration>? = null
     private val activeSessions = ConcurrentHashMap<String, SessionInfo>()
-    
+
     data class SessionInfo(
         val id: String,
         val clientInfo: String,
@@ -68,11 +76,7 @@ class McpServer(private val context: Context) {
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 ktorServer = embeddedServer(Netty, port = PORT) {
-                    // Install required features
-                    install(SSE) {
-                        // Configure SSE settings
-                    }
-                    
+                    install(SSE)
                     install(CORS) {
                         allowMethod(HttpMethod.Options)
                         allowMethod(HttpMethod.Get)
@@ -85,17 +89,211 @@ class McpServer(private val context: Context) {
                         allowHeader("X-Request-Id")
                         allowHeader("X-Client-Name")
                         allowHeader("X-Client-Version")
-                        anyHost() // In production, specify allowed origins
+                        anyHost()
                         allowCredentials = true
                     }
-                    
+
                     routing {
-                        // Health check endpoint
+
+                        // ══════════════════════════════════════════════════════
+                        // ENDPOINTS REST COMPATIBLES CONFLUENCE
+                        // ══════════════════════════════════════════════════════
+
+                        // GET /v1/info — infos compte (compatible Desktop API)
+                        get("/v1/info") {
+                            Log.d(TAG, "REST /v1/info")
+                            val ip = getLocalIpAddress()
+                            val info = buildJsonObject {
+                                put("userID", "@beeper-android:beeper.com")
+                                put("deviceID", "android-$ip")
+                                put("version", VERSION)
+                                put("platform", "android")
+                            }
+                            call.respondText(info.toString(), ContentType.Application.Json)
+                        }
+
+                        // GET /v1/chats — liste des conversations
+                        get("/v1/chats") {
+                            Log.d(TAG, "REST /v1/chats")
+                            val limit = call.request.queryParameters["limit"]?.toIntOrNull() ?: 50
+                            val offset = call.request.queryParameters["cursor"]?.toIntOrNull() ?: 0
+                            val protocol = call.request.queryParameters["protocol"]
+
+                            try {
+                                val paramBuilder = StringBuilder("limit=$limit&offset=$offset")
+                                protocol?.let { paramBuilder.append("&protocol=${Uri.encode(it)}") }
+
+                                val queryUri = "content://$BEEPER_AUTHORITY/chats?$paramBuilder".toUri()
+                                val chatsArray = buildJsonArray {
+                                    context.contentResolver.query(queryUri, null, null, null, null)?.use { cursor ->
+                                        val roomIdIdx = cursor.getColumnIndex("roomId")
+                                        val titleIdx = cursor.getColumnIndex("title")
+                                        val previewIdx = cursor.getColumnIndex("messagePreview")
+                                        val senderEntityIdIdx = cursor.getColumnIndex("senderEntityId")
+                                        val protocolIdx = cursor.getColumnIndex("protocol")
+                                        val unreadIdx = cursor.getColumnIndex("unreadCount")
+                                        val timestampIdx = cursor.getColumnIndex("timestamp")
+                                        val oneToOneIdx = cursor.getColumnIndex("oneToOne")
+                                        val isMutedIdx = cursor.getColumnIndex("isMuted")
+
+                                        while (cursor.moveToNext()) {
+                                            val roomId = cursor.getString(roomIdIdx) ?: continue
+                                            val proto = cursor.getString(protocolIdx) ?: "matrix"
+                                            add(buildJsonObject {
+                                                put("id", roomId)
+                                                put("roomId", roomId)
+                                                put("name", cursor.getString(titleIdx) ?: "")
+                                                put("protocol", proto)
+                                                // Normaliser protocol → netKey compatible Confluence
+                                                put("network", normalizeProtocol(proto))
+                                                put("unreadCount", cursor.getInt(unreadIdx))
+                                                put("timestamp", cursor.getLong(timestampIdx))
+                                                put("lastActivityTS", cursor.getLong(timestampIdx))
+                                                put("isOneToOne", cursor.getInt(oneToOneIdx) == 1)
+                                                put("isMuted", cursor.getInt(isMutedIdx) == 1)
+                                                put("preview", cursor.getString(previewIdx) ?: "")
+                                                put("senderEntityId", cursor.getString(senderEntityIdIdx) ?: "")
+                                            })
+                                        }
+                                    }
+                                }
+
+                                val response = buildJsonObject {
+                                    putJsonArray("items") { chatsArray.forEach { add(it) } }
+                                    put("hasMore", chatsArray.size == limit)
+                                }
+                                call.respondText(response.toString(), ContentType.Application.Json)
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Error /v1/chats: ${e.message}")
+                                call.respondText(
+                                    """{"error":"${e.message}","items":[]}""",
+                                    ContentType.Application.Json,
+                                    HttpStatusCode.InternalServerError
+                                )
+                            }
+                        }
+
+                        // GET /v1/chats/{chatId}/messages — messages d'une conversation
+                        get("/v1/chats/{chatId}/messages") {
+                            val chatId = call.parameters["chatId"] ?: ""
+                            val limit = call.request.queryParameters["limit"]?.toIntOrNull() ?: 50
+                            val offset = call.request.queryParameters["cursor"]?.toIntOrNull() ?: 0
+                            Log.d(TAG, "REST /v1/chats/$chatId/messages limit=$limit offset=$offset")
+
+                            try {
+                                val encodedRoomId = Uri.encode(chatId)
+                                val queryUri = "content://$BEEPER_AUTHORITY/messages?roomIds=$encodedRoomId&limit=$limit&offset=$offset".toUri()
+
+                                val msgsArray = buildJsonArray {
+                                    context.contentResolver.query(queryUri, null, null, null, null)?.use { cursor ->
+                                        val originalIdIdx = cursor.getColumnIndex("originalId")
+                                        val roomIdIdx = cursor.getColumnIndex("roomId")
+                                        val senderContactIdIdx = cursor.getColumnIndex("senderContactId")
+                                        val timestampIdx = cursor.getColumnIndex("timestamp")
+                                        val isSentByMeIdx = cursor.getColumnIndex("isSentByMe")
+                                        val isDeletedIdx = cursor.getColumnIndex("isDeleted")
+                                        val typeIdx = cursor.getColumnIndex("type")
+                                        val textContentIdx = cursor.getColumnIndex("text_content")
+                                        val displayNameIdx = cursor.getColumnIndex("displayName")
+                                        val reactionsIdx = cursor.getColumnIndex("reactions")
+
+                                        while (cursor.moveToNext()) {
+                                            val msgId = cursor.getString(originalIdIdx) ?: continue
+                                            val ts = cursor.getLong(timestampIdx)
+                                            val isSentByMe = cursor.getInt(isSentByMeIdx) == 1
+                                            val text = cursor.getString(textContentIdx) ?: ""
+                                            val displayName = cursor.getString(displayNameIdx) ?: ""
+                                            val senderId = cursor.getString(senderContactIdIdx) ?: ""
+
+                                            add(buildJsonObject {
+                                                put("id", msgId)
+                                                put("roomId", cursor.getString(roomIdIdx) ?: chatId)
+                                                put("text", text)
+                                                put("timestamp", ts.toString())
+                                                put("sortKey", ts.toString().padStart(20, '0'))
+                                                // Champs compatibles Desktop API
+                                                put("isSender", isSentByMe)
+                                                put("isFromMe", isSentByMe)
+                                                put("isSentByMe", isSentByMe)
+                                                put("senderID", senderId)
+                                                put("senderName", displayName)
+                                                put("type", cursor.getString(typeIdx) ?: "TEXT")
+                                                put("isDeleted", cursor.getInt(isDeletedIdx) == 1)
+                                                put("reactions", cursor.getString(reactionsIdx) ?: "")
+                                            })
+                                        }
+                                    }
+                                }
+
+                                val response = buildJsonObject {
+                                    putJsonArray("items") { msgsArray.forEach { add(it) } }
+                                    put("hasMore", msgsArray.size == limit)
+                                }
+                                call.respondText(response.toString(), ContentType.Application.Json)
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Error /v1/chats/$chatId/messages: ${e.message}")
+                                call.respondText(
+                                    """{"error":"${e.message}","items":[]}""",
+                                    ContentType.Application.Json,
+                                    HttpStatusCode.InternalServerError
+                                )
+                            }
+                        }
+
+                        // POST /v1/chats/{chatId}/messages — envoyer un message
+                        post("/v1/chats/{chatId}/messages") {
+                            val chatId = call.parameters["chatId"] ?: ""
+                            Log.d(TAG, "REST POST /v1/chats/$chatId/messages")
+
+                            try {
+                                val body = call.receiveText()
+                                val json = Json.parseToJsonElement(body).jsonObject
+                                val text = json["text"]?.jsonPrimitive?.content ?: ""
+
+                                if (text.isEmpty()) {
+                                    call.respondText(
+                                        """{"error":"text is required"}""",
+                                        ContentType.Application.Json,
+                                        HttpStatusCode.BadRequest
+                                    )
+                                    return@post
+                                }
+
+                                val uriBuilder = "content://$BEEPER_AUTHORITY/messages".toUri().buildUpon()
+                                uriBuilder.appendQueryParameter("roomId", chatId)
+                                uriBuilder.appendQueryParameter("text", text)
+
+                                val result = context.contentResolver.insert(uriBuilder.build(), android.content.ContentValues())
+
+                                if (result != null) {
+                                    val response = buildJsonObject {
+                                        put("success", true)
+                                        put("roomId", chatId)
+                                        put("text", text)
+                                    }
+                                    call.respondText(response.toString(), ContentType.Application.Json)
+                                } else {
+                                    call.respondText(
+                                        """{"error":"Failed to send message"}""",
+                                        ContentType.Application.Json,
+                                        HttpStatusCode.InternalServerError
+                                    )
+                                }
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Error POST /v1/chats/$chatId/messages: ${e.message}")
+                                call.respondText(
+                                    """{"error":"${e.message}"}""",
+                                    ContentType.Application.Json,
+                                    HttpStatusCode.InternalServerError
+                                )
+                            }
+                        }
+
+                        // ══════════════════════════════════════════════════════
+                        // ENDPOINTS ORIGINAUX MCP
+                        // ══════════════════════════════════════════════════════
+
                         get("/health") {
-                            Log.d(TAG, "=== HTTP REQUEST: /health ===")
-                            Log.d(TAG, "Remote address: ${call.request.local.remoteHost}")
-                            Log.d(TAG, "User agent: ${call.request.headers["User-Agent"] ?: "unknown"}")
-                            
                             val status = buildJsonObject {
                                 put("status", "healthy")
                                 put("service", SERVICE_NAME)
@@ -104,23 +302,10 @@ class McpServer(private val context: Context) {
                                 put("sessions", activeSessions.size)
                                 put("ip", getLocalIpAddress())
                             }
-                            call.respondText(
-                                status.toString(),
-                                ContentType.Application.Json,
-                                HttpStatusCode.OK
-                            )
-                            
-                            Log.d(TAG, "=== HTTP RESPONSE: /health ===")
-                            Log.d(TAG, "Status: 200 OK")
-                            Log.d(TAG, "Response length: ${status.toString().length} bytes")
+                            call.respondText(status.toString(), ContentType.Application.Json)
                         }
-                        
-                        // Session info endpoint
+
                         get("/sessions") {
-                            Log.d(TAG, "=== HTTP REQUEST: /sessions ===")
-                            Log.d(TAG, "Remote address: ${call.request.local.remoteHost}")
-                            Log.d(TAG, "Current sessions: ${activeSessions.size}")
-                            
                             val sessions = buildJsonArray {
                                 activeSessions.forEach { (id, info) ->
                                     add(buildJsonObject {
@@ -130,215 +315,114 @@ class McpServer(private val context: Context) {
                                     })
                                 }
                             }
-                            call.respondText(
-                                sessions.toString(),
-                                ContentType.Application.Json,
-                                HttpStatusCode.OK
-                            )
-                            
-                            Log.d(TAG, "=== HTTP RESPONSE: /sessions ===")
-                            Log.d(TAG, "Status: 200 OK")
-                            Log.d(TAG, "Sessions returned: ${activeSessions.size}")
-                            Log.d(TAG, "Response length: ${sessions.toString().length} bytes")
+                            call.respondText(sessions.toString(), ContentType.Application.Json)
                         }
-                        
-                        // Main MCP SSE endpoint
+
                         sse("/sse") {
-                            Log.i(TAG, "=== SSE CONNECTION ===")
-                            Log.i(TAG, "New SSE connection established")
-                            Log.i(TAG, "Remote address: ${call.request.local.remoteHost}")
-                            Log.i(TAG, "User agent: ${call.request.headers["User-Agent"] ?: "unknown"}")
                             handleMcpSession(this)
                         }
-                        
-                        // Alternative MCP endpoint for compatibility
+
                         mcp("/mcp") {
                             createMcpServer()
                         }
                     }
                 }.start(wait = false)
-                
+
                 val ipAddress = getLocalIpAddress()
-                Log.i(TAG, "======================================")
-                Log.i(TAG, "=== FULL MCP SERVER STARTED ===")
-                Log.i(TAG, "======================================")
-                Log.i(TAG, "Server: $SERVICE_NAME v$VERSION")
-                Log.i(TAG, "Address: http://$ipAddress:$PORT")
-                Log.i(TAG, "SSE endpoint: http://$ipAddress:$PORT/sse")
-                Log.i(TAG, "Health check: http://$ipAddress:$PORT/health")
-                Log.i(TAG, "Sessions endpoint: http://$ipAddress:$PORT/sessions")
-                Log.i(TAG, "MCP endpoint: http://$ipAddress:$PORT/mcp")
-                Log.i(TAG, "Start time: ${System.currentTimeMillis()}")
-                Log.i(TAG, "======================================")
-                
-                
+                Log.i(TAG, "=== CONFLUENCE-COMPATIBLE SERVER STARTED ===")
+                Log.i(TAG, "REST API: http://$ipAddress:$PORT/v1/chats")
+                Log.i(TAG, "REST API: http://$ipAddress:$PORT/v1/info")
+                Log.i(TAG, "Health: http://$ipAddress:$PORT/health")
+
             } catch (e: Exception) {
-                Log.e(TAG, "======================================")
-                Log.e(TAG, "=== SERVER START FAILED ===")
-                Log.e(TAG, "======================================")
-                Log.e(TAG, "Error: ${e.message}")
-                Log.e(TAG, "Exception type: ${e.javaClass.simpleName}")
-                Log.e(TAG, "Time: ${System.currentTimeMillis()}")
-                Log.e(TAG, "======================================")
-                Log.e(TAG, "Full stack trace:", e)
+                Log.e(TAG, "Server start failed: ${e.message}", e)
             }
         }
     }
-    
+
+    // Normaliser les protocols Beeper Android → netKeys Confluence
+    private fun normalizeProtocol(proto: String): String {
+        return when (proto.lowercase()) {
+            "whatsapp" -> "whatsapp"
+            "telegram" -> "telegram"
+            "signal" -> "signal"
+            "instagram", "instagram_e2ee" -> "instagram"
+            "facebook", "messenger" -> "facebook"
+            "imessage", "apple" -> "imessage"
+            "sms", "gmessages", "android_sms" -> "sms"
+            "discord" -> "discord"
+            "slack" -> "slack"
+            "twitter", "twitter_dm" -> "twitter"
+            "linkedin" -> "linkedin"
+            "googlevoice" -> "googlevoice"
+            "googlechat" -> "googlechat"
+            "matrix", "beeper", "hungryserv" -> "matrix"
+            "bluesky" -> "bluesky"
+            else -> proto.lowercase()
+        }
+    }
+
     private suspend fun handleMcpSession(session: ServerSSESession) {
         val sessionId = generateSessionId()
-        val clientName = "Unknown" // Headers not directly accessible in SSE session
-        val clientVersion = "Unknown"
-        
-        val sessionInfo = SessionInfo(
-            id = sessionId,
-            clientInfo = "$clientName/$clientVersion"
-        )
-        
-        activeSessions[sessionId] = sessionInfo
-        Log.i(TAG, "=== NEW MCP SESSION ===")
-        Log.i(TAG, "Session ID: $sessionId")
-        Log.i(TAG, "Client: $clientName/$clientVersion")
-        Log.i(TAG, "Time: ${System.currentTimeMillis()}")
-        Log.i(TAG, "Active sessions: ${activeSessions.size}")
-        
+        activeSessions[sessionId] = SessionInfo(id = sessionId, clientInfo = "unknown")
         try {
-            // Send initialization event
             session.send("event: initialize\n")
             session.send("data: ${createInitializeResponse()}\n\n")
-            
-            // Keep connection alive and handle incoming messages
             while (true) {
-                // This would normally handle incoming SSE messages
-                // The kotlin-sdk handles this internally
-                kotlinx.coroutines.delay(30000) // Keep-alive ping every 30 seconds
+                kotlinx.coroutines.delay(30000)
                 session.send("event: ping\n")
                 session.send("data: {\"type\":\"ping\",\"timestamp\":${System.currentTimeMillis()}}\n\n")
             }
         } finally {
             activeSessions.remove(sessionId)
-            val duration = System.currentTimeMillis() - sessionInfo.startTime
-            Log.i(TAG, "=== MCP SESSION ENDED ===")
-            Log.i(TAG, "Session ID: $sessionId")
-            Log.i(TAG, "Duration: ${duration}ms")
-            Log.i(TAG, "Remaining sessions: ${activeSessions.size}")
         }
     }
-    
+
     private fun createMcpServer(): Server {
         val server = Server(
-            serverInfo = Implementation(
-                name = SERVICE_NAME,
-                version = VERSION
-            ),
+            serverInfo = Implementation(name = SERVICE_NAME, version = VERSION),
             options = ServerOptions(
                 capabilities = ServerCapabilities(
                     tools = ServerCapabilities.Tools(listChanged = true),
-                    resources = ServerCapabilities.Resources(
-                        subscribe = true,
-                        listChanged = true
-                    ),
-                    prompts = ServerCapabilities.Prompts(
-                        listChanged = true
-                    ),
-                    // logging capability can be added when available in SDK
+                    resources = ServerCapabilities.Resources(subscribe = true, listChanged = true),
+                    prompts = ServerCapabilities.Prompts(listChanged = true)
                 )
             )
         )
-        
-        // Add tools with full parameter schemas
-        server.addTool(
-            name = "get_chats",
-            description = "Retrieves chats/conversations with optional filtering. Parameters: roomIds (optional, comma-separated), isLowPriority (optional, 0/1), isArchived (optional, 0/1), isUnread (optional, 0/1), showInAllChats (optional, 0/1), protocol (optional, filter by network - any messaging protocol like 'whatsapp', 'telegram', 'signal', 'beeper'/'matrix' for native chats, etc.), limit (optional, default 100), offset (optional, default 0). Returns formatted text with complete chat information and pagination details.",
-        ) { request ->
+        server.addTool("get_chats", "Retrieves chats/conversations") { request ->
             context.contentResolver.handleGetChats(request)
         }
-        
-        
-        server.addTool(
-            name = "get_contacts",
-            description = "Retrieves contacts/senders with optional filtering. Parameters: senderIds (optional, comma-separated), roomIds (optional, comma-separated), query (optional, full-text search), protocol (optional, filter by network - any messaging protocol like 'whatsapp', 'telegram', 'signal', 'beeper'/'matrix' for native contacts, etc.), limit (optional, default 100), offset (optional, default 0). Returns contact details including display names, protocols, room memberships, and pagination details.",
-        ) { request ->
+        server.addTool("get_contacts", "Retrieves contacts") { request ->
             context.contentResolver.handleGetContacts(request)
         }
-        
-        server.addTool(
-            name = "send_message",
-            description = "Send a text message to a specific chat room. Requires room_id (the Matrix room ID like !roomId:server.com) and text (the message content). Returns success/failure status.",
-        ) { request ->
+        server.addTool("send_message", "Send a text message") { request ->
             context.contentResolver.handleSendMessage(request)
         }
-        
-        server.addTool(
-            name = "get_messages",
-            description = "Get messages from chats with optional filtering. Parameters: roomIds (optional, comma-separated to filter specific rooms), senderId (optional, filter by sender), query (optional, full-text search), contextBefore (optional, number), contextAfter (optional, number), openAtUnread (optional, boolean), limit (optional, default 100), offset (optional, default 0). Returns formatted messages with sender info, timestamps, content, reactions, and pagination details.",
-        ) { request ->
+        server.addTool("get_messages", "Get messages from chats") { request ->
             context.contentResolver.handleGetMessages(request)
         }
-        
-        // Add resources
-        server.addResource(
-            uri = "beeper://chats",
-            name = "Chat List",
-            description = "List of all Beeper chats",
-            mimeType = "application/json"
+        server.addResource(uri = "beeper://chats", name = "Chat List",
+            description = "List of all Beeper chats", mimeType = "application/json"
         ) { request ->
-            ReadResourceResult(
-                contents = listOf(
-                    TextResourceContents(
-                        uri = request.uri,
-                        text = getChatListResource(),
-                        mimeType = "application/json"
-                    )
-                )
-            )
+            ReadResourceResult(contents = listOf(TextResourceContents(
+                uri = request.uri, text = getChatListResource(), mimeType = "application/json"
+            )))
         }
-        
-        
-        // Add prompts
-        server.addPrompt(
-            name = "summarize_chats",
-            description = "Generate a summary of recent chat activity",
-            arguments = listOf(
-                PromptArgument(
-                    name = "time_range",
-                    description = "Time range for summary (e.g., '1h', '24h', '7d')",
-                    required = false
-                )
-            )
+        server.addPrompt("summarize_chats", "Generate a summary of recent chat activity",
+            arguments = listOf(PromptArgument(name = "time_range", required = false))
         ) { request ->
-            GetPromptResult(
-                description = "Summary of recent chat activity",
-                messages = listOf(
-                    PromptMessage(
-                        role = Role.user,
-                        content = TextContent(
-                            text = generateChatSummaryPrompt(request.arguments)
-                        )
-                    )
-                )
-            )
+            GetPromptResult(description = "Summary", messages = listOf(
+                PromptMessage(role = Role.user, content = TextContent(
+                    text = "Summarize chat activity for ${request.arguments?.get("time_range") ?: "24h"}"
+                ))
+            ))
         }
-        
         return server
     }
-    
+
     private fun createInitializeResponse(): String {
         return buildJsonObject {
             put("protocolVersion", "2024-11-05")
-            put("capabilities", buildJsonObject {
-                put("tools", buildJsonObject {
-                    put("listChanged", true)
-                })
-                put("resources", buildJsonObject {
-                    put("subscribe", true)
-                    put("listChanged", true)
-                })
-                put("prompts", buildJsonObject {
-                    put("listChanged", true)
-                })
-                put("logging", buildJsonObject {})
-            })
             put("serverInfo", buildJsonObject {
                 put("name", SERVICE_NAME)
                 put("version", VERSION)
@@ -349,50 +433,31 @@ class McpServer(private val context: Context) {
     private fun getChatListResource(): String {
         return try {
             val uri = "content://$BEEPER_AUTHORITY/chats".toUri()
-            val cursor = context.contentResolver.query(uri, null, null, null, null)
-            
             val chats = buildJsonArray {
-                cursor?.use {
-                    val roomIdIdx = it.getColumnIndex("roomId")
-                    val titleIdx = it.getColumnIndex("title")
-                    val unreadIdx = it.getColumnIndex("unreadCount")
-                    val timestampIdx = it.getColumnIndex("timestamp")
-                    
-                    while (it.moveToNext()) {
+                context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                    val roomIdIdx = cursor.getColumnIndex("roomId")
+                    val titleIdx = cursor.getColumnIndex("title")
+                    val unreadIdx = cursor.getColumnIndex("unreadCount")
+                    val timestampIdx = cursor.getColumnIndex("timestamp")
+                    while (cursor.moveToNext()) {
                         add(buildJsonObject {
-                            put("roomId", it.getString(roomIdIdx) ?: "")
-                            put("title", it.getString(titleIdx) ?: "")
-                            put("unreadCount", it.getInt(unreadIdx))
-                            put("timestamp", it.getLong(timestampIdx))
+                            put("roomId", cursor.getString(roomIdIdx) ?: "")
+                            put("title", cursor.getString(titleIdx) ?: "")
+                            put("unreadCount", cursor.getInt(unreadIdx))
+                            put("timestamp", cursor.getLong(timestampIdx))
                         })
                     }
                 }
             }
-            
             chats.toString()
         } catch (e: Exception) {
             Log.e(TAG, "Error getting chat list resource", e)
             "[]"
         }
     }
-    
-    
-    private fun generateChatSummaryPrompt(arguments: Map<String, String>?): String {
-        val timeRange = arguments?.get("time_range") ?: "24h"
-        return """
-            Please summarize the chat activity for the last $timeRange.
-            Focus on:
-            - Number of active chats
-            - Unread message distribution
-            - Most active conversations
-            - Key topics discussed
-        """.trimIndent()
-    }
-    
-    private fun generateSessionId(): String {
-        return "session_${System.currentTimeMillis()}_${(Math.random() * 10000).toInt()}"
-    }
-    
+
+    private fun generateSessionId() = "session_${System.currentTimeMillis()}_${(Math.random() * 10000).toInt()}"
+
     private fun getLocalIpAddress(): String {
         try {
             val interfaces = NetworkInterface.getNetworkInterfaces()
@@ -413,35 +478,10 @@ class McpServer(private val context: Context) {
         }
         return "127.0.0.1"
     }
-    
-    
-    
+
     fun stop() {
-        try {
-            // Clear active sessions
-            activeSessions.clear()
-            
-            
-            // Stop Ktor server
-            ktorServer?.stop()
-            
-            Log.i(TAG, "======================================")
-            Log.i(TAG, "=== FULL MCP SERVER STOPPED ===")
-            Log.i(TAG, "======================================")
-            Log.i(TAG, "Server: $SERVICE_NAME v$VERSION")
-            Log.i(TAG, "Stop time: ${System.currentTimeMillis()}")
-            Log.i(TAG, "Sessions cleared: ${activeSessions.size}")
-            Log.i(TAG, "======================================")
-            
-        } catch (e: Exception) {
-            Log.e(TAG, "======================================")
-            Log.e(TAG, "=== SERVER STOP ERROR ===")
-            Log.e(TAG, "======================================")
-            Log.e(TAG, "Error: ${e.message}")
-            Log.e(TAG, "Exception type: ${e.javaClass.simpleName}")
-            Log.e(TAG, "Time: ${System.currentTimeMillis()}")
-            Log.e(TAG, "======================================")
-            Log.e(TAG, "Full stack trace:", e)
-        }
+        activeSessions.clear()
+        ktorServer?.stop()
+        Log.i(TAG, "Server stopped")
     }
 }
