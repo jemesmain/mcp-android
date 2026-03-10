@@ -401,21 +401,32 @@ class McpServer(private val context: Context) {
         server.addTool("get_messages", "Get messages from chats") { request ->
             context.contentResolver.handleGetMessages(request)
         }
-        server.addResource(uri = "beeper://chats", name = "Chat List",
-            description = "List of all Beeper chats", mimeType = "application/json"
+        server.addResource(
+            uri = "beeper://chats",
+            name = "Chat List",
+            description = "List of all Beeper chats",
+            mimeType = "application/json"
         ) { request ->
             ReadResourceResult(contents = listOf(TextResourceContents(
                 uri = request.uri, text = getChatListResource(), mimeType = "application/json"
             )))
         }
-        server.addPrompt("summarize_chats", "Generate a summary of recent chat activity",
-            arguments = listOf(PromptArgument(name = "time_range", required = false))
+        server.addPrompt(
+            name = "summarize_chats",
+            description = "Generate a summary of recent chat activity",
+            arguments = listOf(PromptArgument(name = "time_range", description = "Time range e.g. 24h", required = false))
         ) { request ->
-            GetPromptResult(description = "Summary", messages = listOf(
-                PromptMessage(role = Role.user, content = TextContent(
-                    text = "Summarize chat activity for ${request.arguments?.get("time_range") ?: "24h"}"
-                ))
-            ))
+            GetPromptResult(
+                description = "Summary",
+                messages = listOf(
+                    PromptMessage(
+                        role = Role.user,
+                        content = TextContent(
+                            text = "Summarize chat activity for ${request.arguments?.get("time_range") ?: "24h"}"
+                        )
+                    )
+                )
+            )
         }
         return server
     }
