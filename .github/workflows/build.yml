@@ -14,15 +14,17 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Fix Gradle wrapper version
+      - name: Install Gradle and fix wrapper
         run: |
-          sed -i 's|gradle-4.4.1-bin.zip|gradle-8.13-bin.zip|' gradle/wrapper/gradle-wrapper.properties
-          cat gradle/wrapper/gradle-wrapper.properties
+          wget -q https://services.gradle.org/distributions/gradle-8.13-bin.zip -O /tmp/gradle.zip
+          unzip -q /tmp/gradle.zip -d /tmp/gradle
+          export PATH=/tmp/gradle/gradle-8.13/bin:$PATH
+          sed -i 's|distributionUrl=.*|distributionUrl=https\\://services.gradle.org/distributions/gradle-8.13-bin.zip|' gradle/wrapper/gradle-wrapper.properties
+          gradle wrapper --gradle-version 8.13
+          chmod +x gradlew
 
       - name: Build APK
-        run: |
-          chmod +x gradlew
-          ./gradlew assembleDebug
+        run: ./gradlew assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
