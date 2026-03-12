@@ -76,9 +76,9 @@ class McpServer(private val context: Context) {
         CoroutineScope(Dispatchers.IO).launch {
             try {
             	// bind toute les interfaces
-                //ktorServer = embeddedServer(Netty, port = PORT) {
+                ktorServer = embeddedServer(Netty, port = PORT) {
                 // bind localhost uniquement pour securite
-                ktorServer = embeddedServer(Netty, port = PORT, host = "127.0.0.1") {
+                //ktorServer = embeddedServer(Netty, port = PORT, host = "127.0.0.1") {
                     install(SSE)
                     install(CORS) {
                         allowMethod(HttpMethod.Options)
